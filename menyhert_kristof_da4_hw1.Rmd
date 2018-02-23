@@ -1,0 +1,936 @@
+---
+title: "Homework Assignment 1"
+author: "Kristof Menyhert"
+date: '2018-02-10'
+output:
+  pdf_document: default
+  html_notebook:
+    df_print: paged
+  html_document:
+    df_print: paged
+subtitle: DA 4 - CEU 2018
+---
+
+Load the packages and set the theme to bw:
+
+```{r, message=FALSE, warning= FALSE}
+library(data.table)
+library(caret)
+library(ggplot2)
+library(knitr)
+library(stargazer)
+library(rattle)
+library(randomForest)
+library(rpart) 
+library(rpart.plot)
+
+
+theme_set(theme_bw()) #globally set ggplot theme to black & white
+```
+
+Load the dataset:
+
+```{r}
+data <- fread("C:/Users/Chronos/OneDrive - Central European University/R/da4_hw1/airbnb_london_cleaned.csv")
+```
+
+Filter for extreme values in price:
+
+This is an arbitrary choice, but helps the prediction a lot from my point of view:
+
+```{r, message=FALSE, warning= FALSE}
+data$price <- as.numeric(data$price)
+ggplot(data, aes(price)) + geom_histogram()
+
+#based on the graph above I choose 600$ to the maximum price:
+data <- data[price < 600] # I lost around 300 observations
+```
+
+Randomly pick a neighborhood with at least 1000 observations:
+
+```{r}
+unique_neigh <- data[, .(observations = .N), by = neighbourhood_cleansed] # count how many observations are there for one neigbourhood
+unique_neigh <- unique_neigh[observations > 1000] #drop neighbourhood with less then 1000 observations
+
+neighbourhood_obs <- unique_neigh$neighbourhood #vector with all the neighbourhood
+
+set.seed(5452)
+random_neighbourhood <- sample(neighbourhood_obs, 1, replace=TRUE)
+```
+
+In this case I randomly selected the following neighborhood:
+```{r}
+random_neighbourhood
+```
+
+Filter for the random neighborhood:
+```{r}
+filtered_data <- data[neighbourhood_cleansed == random_neighbourhood]
+```
+
+## I. TASK: MODELING WITH THE RANDOMLY SELECTED NEIGHBOURHOOD:
+
+At first, we need to decide whether we are going to predict the price or the log_price:
+
+Histogram of price:
+
+```{r, message=FALSE, warning= FALSE}
+filtered_data$price <- as.numeric(filtered_data$price)
+summary(filtered_data$price)
+
+filtered_data <- filtered_data[price>0] #drop NAs
+
+ggplot(filtered_data, aes(price)) + geom_histogram()
+```
+
+I think predicting log_price make more sense, since the normal price variable is not normally distributed. Therefore I create the log_price variable:
+
+```{r, message=FALSE, warning= FALSE}
+filtered_data[, log_price := log(price)]
+ggplot(filtered_data, aes(log_price)) + geom_histogram()
+```
+
+It looks like that log_price distribution is closer to normal, therefore for my further analysis I use log_price.
+
+Then I split the data to train and test sets:
+
+```{r}
+cut <- createDataPartition(y = filtered_data$price, times = 1, p = 0.7, list = FALSE)
+
+filtered_data_train <- filtered_data[cut, ]
+
+filtered_data_test <- filtered_data[-cut, ]
+
+# check the cut
+length(filtered_data$price) == (length(filtered_data_train$price) + length(filtered_data_test$price))
+```
+
+
+#### a) Show 4 different linear models, arguing for choices (#4 should be most complex)
+
+<strong> 1st linear model: Log_Price vs. Accommodates </strong>
+
+Some of the variables are characters and not numbers as they should be I have to manually transform them to numeric values:
+```{r}
+filtered_data_train$accommodates <- as.numeric(filtered_data_train$accommodates)
+filtered_data_train <- filtered_data_train[accommodates>0] #drop NAs
+
+#do the same for test data:
+filtered_data_test$accommodates <- as.numeric(filtered_data_test$accommodates)
+filtered_data_test <- filtered_data_test[accommodates>0]
+
+```
+
+```{r}
+ggplot(filtered_data_train, aes(x=accommodates, y=log_price)) + geom_boxplot((aes(group = cut_width(accommodates, 1))))
+```
+
+Seems like if an accommodation can host higher number of guests the price is rising on average, but not linear. Therefore I use the poly function with a quadratic term.
+
+In the 1st model I use only 1 variable.
+```{r}
+#without CV:
+lm_model1 <- train(log_price ~ poly(accommodates,2),
+                  data = filtered_data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "none"))
+
+#with CV:
+lm_model1_cv <- train(log_price ~ poly(accommodates,2),
+                  data = filtered_data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "cv", number = 10))
+
+summary(lm_model1)
+lm_model1_cv
+```
+
+If we look at the Rsquared they are close to each other. Using CV in this case has little effect. I think it is because we have 1000+ observations. On big datasets CV is not as important as on small ones.
+
+<strong> 2nd linear model: Log_Price vs. Accommodates + Room_type </strong>
+
+I extend the model with 1 more variable: Roomy_type.
+
+Log_price vs. Room type:
+```{r}
+ggplot(filtered_data_train, aes(x=room_type, y=log_price)) + geom_boxplot()
+```
+
+As we can see on the graph above, room_type has a lots of effect on price.
+
+Room_type is a factor variable, therefore I use in my model as a factor:
+
+```{r}
+# Without CV:
+lm_model2 <- train(log_price ~ poly(accommodates,2) + as.factor(room_type),
+                  data = filtered_data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "none"))
+
+# With CV:
+lm_model2_cv <- train(log_price ~ poly(accommodates,2) + as.factor(room_type),
+                  data = filtered_data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "cv", number = 10))
+
+summary(lm_model2)
+lm_model2_cv$finalModel
+```
+R-squared improved a bit.
+
+<strong> 3rd linear model: Log_Price vs. Accommodates + Room_type + Location rating </strong>
+
+
+
+My basic thought was the following: one of the biggest factor concerning price of an accommodation is the location.
+
+I found a location related variable, namely: review_scores_rating which is the score for the location by the guest users.
+
+There are a lots of missing values, but I think we can use it for something:
+
+I created a factor variables, based on the review_scores_rating variable, where I did the following:
+
+* I assigned "10" for accommodations with location score above 9.
+* I assigned "Under_10" for accommodations with scores not above 9.
+* I assigned "Not included" for missing values.
+
+See the coding below:
+
+```{r}
+filtered_data_train$review_scores_location <- as.numeric(filtered_data_train$review_scores_location)
+
+filtered_data_train[, location_score_above_9 := ifelse(review_scores_location > 9, "10", "Under_10")]
+
+filtered_data_train[, location_score_above_9 := ifelse(is.na(location_score_above_9), "Not included", location_score_above_9)]
+
+ggplot(filtered_data_train, aes(x=location_score_above_9, y=log_price)) + geom_boxplot()
+
+#do the same for test data:
+filtered_data_test$review_scores_location <- as.numeric(filtered_data_test$review_scores_location)
+
+filtered_data_test[, location_score_above_9 := ifelse(review_scores_location > 9, "10", "Under_10")]
+
+filtered_data_test[, location_score_above_9 := ifelse(is.na(location_score_above_9), "Not included", location_score_above_9)]
+```
+
+Actually it turned out that this variable does not have a lots of effect to the prices:
+
+```{r}
+#without CV
+lm_model3 <- train(log_price ~ poly(accommodates,2) + as.factor(room_type) + as.factor(location_score_above_9),
+                  data = filtered_data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "none"))
+
+#with CV
+lm_model3_cv <- train(log_price ~ poly(accommodates,2) + as.factor(room_type) + as.factor(location_score_above_9),
+                  data = filtered_data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "cv", number = 10))
+```
+
+```{r}
+summary(lm_model3)
+```
+
+R-squared improved a bit again.
+
+<strong> 4rd linear model: Log_Price vs. Accommodates + Room_type + Location rating + Security_deposit + Bathrooms etc. </strong>
+
+I extended my model with some other variables as well. 
+
+```{r, , message=FALSE, warning= FALSE}
+filtered_data_train$security_deposit <- as.numeric(filtered_data_train$security_deposit)
+filtered_data_train[, security_deposit_factor := ifelse(is.na(security_deposit), "No", ifelse(security_deposit > 500, "expensice", "not_expensive"))]
+
+ggplot(filtered_data_train, aes(x=security_deposit_factor, y=log_price)) + geom_boxplot()
+
+# do the same for test set:
+filtered_data_test$security_deposit <- as.numeric(filtered_data_test$security_deposit)
+filtered_data_test[, security_deposit_factor := ifelse(is.na(security_deposit), "No", ifelse(security_deposit > 500, "expensice", "not_expensive"))]
+
+```
+
+Other variables correction:
+
+```{r}
+filtered_data_train$host_is_superhost <- as.numeric(filtered_data_train$host_is_superhost)
+filtered_data_train[, host_is_superhost :=ifelse(host_is_superhost == 1, 1, 0)]
+filtered_data_train$host_is_superhost <- as.factor(filtered_data_train$host_is_superhost)
+
+filtered_data_train$bathrooms <- as.numeric(filtered_data_train$bathrooms)
+
+filtered_data_train <- filtered_data_train[!is.na(bathrooms)]
+
+#do the same for test set:
+filtered_data_test$host_is_superhost <- as.numeric(filtered_data_test$host_is_superhost)
+filtered_data_test[, host_is_superhost :=ifelse(host_is_superhost == 1, 1, 0)]
+filtered_data_test$host_is_superhost <- as.factor(filtered_data_test$host_is_superhost)
+
+filtered_data_test$bathrooms <- as.numeric(filtered_data_test$bathrooms)
+
+filtered_data_test <- filtered_data_test[!is.na(bathrooms)]
+```
+
+
+```{r}
+lm_model4 <- train(log_price ~ poly(accommodates,2) + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) +  host_is_superhost+bathrooms,
+                  data = filtered_data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "none"))
+
+lm_model4_cv <- train(log_price ~ poly(accommodates,2) + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + host_is_superhost + bathrooms,
+                  data = filtered_data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "cv", number = 10))
+```
+
+```{r}
+summary(lm_model4)
+```
+
+#### LASSO on the 4th model:
+
+For my 5th model I used LASSO on my previous (4th) model:
+```{r}
+set.seed(123)
+
+#Without CV. Only wiht 1 lamda parameter:
+lm_model_lasso <- train(log_price ~ poly(accommodates,2) + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + host_is_superhost + bathrooms,
+                  data = filtered_data_train,
+                  method = "glmnet",
+                  trControl = trainControl(method = "none"),
+                  #preProcess = c("center", "scale"),
+                  tuneGrid = expand.grid("alpha" = c(1),"lambda" = c(0.1)))
+
+#with CV. With 4 lambda parameter:
+lm_model_lasso_cv <- train(log_price ~ poly(accommodates,2) + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + host_is_superhost + bathrooms,
+                  data = filtered_data_train,
+                  method = "glmnet",
+                  trControl = trainControl(method = "cv", number = 10),
+                  #preProcess = c("center", "scale"),
+                  tuneGrid = expand.grid("alpha" = c(1),"lambda" = c(0.1, 0.01, 0.001, 0.0001)))
+
+lm_model_lasso_cv
+
+```
+
+
+## II. TASK: MODELING WITH THE FULL LONDON DATASET:
+
+In the 2nd task I am doing the same as before just for the full London dataset, and also I add the neighborhood variable as factor to the regressions for controlling for the different neighborhood. 1st I do not do any interaction. At the end of the exercise I try to create a final model with interactions.
+
+Create again the log_price variable for the full dataset.
+
+```{r, message=FALSE, warning= FALSE}
+data$price <- as.numeric(data$price)
+data <- data[price > 0]
+
+ggplot(data, aes(price)) + geom_histogram() #log normal dist
+
+data[, log_price := log(price)]
+
+ggplot(data, aes(log_price)) + geom_histogram()
+
+```
+
+<strong> This is why I add the neighborhoods to the model: </strong>
+
+Neighbors vs. price plot:
+
+```{r}
+
+ggplot(data, aes(reorder(as.factor(neighbourhood_cleansed), log_price, FUN=median),log_price)) + geom_boxplot() +  theme(axis.text.x = element_text(angle=90, hjust=1, size = 7)) + labs(x = "Neighbours")
+
+```
+
+City of London is the most expensive neighborhood.
+
+<strong>Next Steps are creating the same dummies as I used before and do some transformations in the data as before</strong>
+
+DO the transformations and any modification before spiting the data to train and test set:
+
+For the accommodation variable:
+```{r}
+data$accommodates <- as.numeric(data$accommodates)
+data <- data[accommodates>0] #drop NAs
+```
+
+Create review_scores factor:
+```{r}
+data$review_scores_location <- as.numeric(data$review_scores_location)
+
+data[, location_score_above_9 := ifelse(review_scores_location > 9, "10", "Under_10")]
+
+data[, location_score_above_9 := ifelse(is.na(location_score_above_9), "Not included", location_score_above_9)]
+```
+
+Fix security_deposit variable and create a factor from it:
+```{r, message=FALSE, warning= FALSE}
+data$security_deposit <- as.numeric(data$security_deposit)
+data[, security_deposit_factor := ifelse(is.na(security_deposit), "No", ifelse(security_deposit > 500, "expensice", "not_expensive"))]
+```
+
+Fix host_is_superhost and the bathrooms variable:
+```{r}
+data$host_is_superhost <- as.numeric(data$host_is_superhost)
+data[, host_is_superhost :=ifelse(host_is_superhost == 1, 1, 0)]
+data$host_is_superhost <- as.factor(data$host_is_superhost)
+
+data <- data[!is.na(host_is_superhost)]
+
+data$bathrooms <- as.numeric(data$bathrooms)
+
+data <- data[!is.na(bathrooms)]
+```
+
+<strong> Do the splitting: </strong>
+
+```{r}
+cut <- createDataPartition(y = data$price, times = 1, p = 0.7, list = FALSE)
+
+data_train <- data[cut, ]
+
+data_test <- data[-cut, ]
+
+# check the cut
+length(data$price) == (length(data_train$price) + length(data_test$price))
+```
+<strong> 1st linear model: Log_Price vs. Neighborhood + Accommodates </strong>
+
+See why:
+```{r}
+
+ggplot(data_train, aes(x=accommodates, y=log_price)) + geom_boxplot((aes(group = cut_width(accommodates, 1))))
+```
+
+```{r}
+# without CV
+lm_model_full1 <- train(log_price ~ poly(accommodates,2) + as.factor(neighbourhood_cleansed),
+                  data = data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "none"))
+# with CV
+lm_model_full1_cv <- train(log_price ~ poly(accommodates,2) + as.factor(neighbourhood_cleansed),
+                  data = data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "cv", number = 10))
+```
+
+<strong> 2nd linear model: Log_Price vs. Neighborhood + Accommodates + Room_type  </strong>
+
+Room_type is a factor variable, therefore I use in my model like a factor.
+
+```{r}
+# without CV
+lm_model_full2 <- train(log_price ~ poly(accommodates,2) + as.factor(neighbourhood_cleansed) + as.factor(room_type),
+                  data = data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "none"))
+# with CV
+lm_model_full2_cv <- train(log_price ~ poly(accommodates,2) + as.factor(neighbourhood_cleansed) + as.factor(room_type),
+                  data = data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "cv", number = 10))
+```
+
+<strong> 3rd linear model: Log_Price vs. Accommodates + Room_type + Location rating </strong>
+
+```{r}
+ggplot(data_train, aes(x=as.factor(review_scores_location), y=log_price)) + geom_boxplot()
+ggplot(data_train, aes(x=location_score_above_9, y=log_price)) + geom_boxplot()
+```
+
+Not a very big effect but still, lets try including it in the model:
+
+```{r}
+# without CV
+lm_model_full3 <- train(log_price ~ poly(accommodates,2) + as.factor(neighbourhood_cleansed) + as.factor(room_type) + as.factor(location_score_above_9),
+                  data = data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "none"))
+# with CV
+lm_model_full3_cv <- train(log_price ~ poly(accommodates,2) + as.factor(neighbourhood_cleansed) + as.factor(room_type) + as.factor(location_score_above_9),
+                  data = data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "cv", number = 10))
+```
+
+<strong> 4rd linear model: Log_Price vs. Neighborhood + Accommodates + Room_type + Location rating + Security_deposit + etc. </strong>
+
+```{r}
+ggplot(data, aes(x=security_deposit_factor, y=log_price)) + geom_boxplot() 
+```
+
+
+```{r}
+# without CV
+lm_model_full4 <- train(log_price ~ poly(accommodates,2) + as.factor(neighbourhood_cleansed) + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + bathrooms + as.factor(host_is_superhost),
+                  data = data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "none"))
+# with CV
+lm_model_full4_cv <- train(log_price ~ poly(accommodates,2) + as.factor(neighbourhood_cleansed) + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + bathrooms + as.factor(host_is_superhost),
+                  data = data_train,
+                  method = "lm",
+                  trControl = trainControl(method = "cv", number = 10))
+```
+#### LASSO on the 4th model:
+
+```{r}
+set.seed(123)
+# without CV
+lm_model_full_lasso <- train(log_price ~ poly(accommodates,2) + as.factor(neighbourhood_cleansed) + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + bathrooms + as.factor(host_is_superhost),
+                  data = data_train,
+                  method = "glmnet",
+                  trControl = trainControl(method = "none"),
+                  #preProcess = c("center", "scale"),
+                  tuneGrid = expand.grid("alpha" = c(1),"lambda" = c(0.1)))
+
+# with CV
+lm_model_full_lasso_cv <- train(log_price ~ poly(accommodates,2) + as.factor(neighbourhood_cleansed) + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + bathrooms + as.factor(host_is_superhost),
+                  data = data_train,
+                  method = "glmnet",
+                  trControl = trainControl(method = "cv", number = 10),
+                  #preProcess = c("center", "scale"),
+                  tuneGrid = expand.grid("alpha" = c(1),"lambda" = c(0.1, 0.01, 0.001, 0.0001)))
+
+lm_model_full_lasso_cv
+
+```
+
+## CALCULATE RMSE FOR ALL THE MODELS ON THE TEST SET:
+
+Now I have all my models:
+
+* 5 model for only 1 neighborhood without cross validation
+* 5 model for only 1 neighborhood with 10 fold CV
+* 5 model for London without cross validation
+* 5 model for London with 10 fold CV
+
+Also, I have:  
+
+* 1 training and 1 test set for only 1 neighbor
+* 1 training and 1 test set for entire London
+
+<strong> Calculate RMSE </strong>
+
+Define RMSE:
+
+```{r}
+#definte RMSE:
+RMSE <- function(x, true_x) sqrt(mean((x - true_x)^2))
+```
+
+
+<strong> Calculate the predicted values on the test set: </strong>
+
+<strong>On the filtered data (for the given neighborhood):</strong>
+```{r}
+# On the filtered data:
+# W/O CV:
+filtered_data_test$predicted_log_price_model1 <- predict.train(lm_model1, newdata = filtered_data_test)
+filtered_data_test$predicted_log_price_model2 <- predict.train(lm_model2, newdata = filtered_data_test)
+filtered_data_test$predicted_log_price_model3 <- predict.train(lm_model3, newdata = filtered_data_test)
+filtered_data_test$predicted_log_price_model4 <- predict.train(lm_model4, newdata = filtered_data_test)
+filtered_data_test$predicted_log_price_model5 <- predict.train(lm_model_lasso, newdata = filtered_data_test)
+#With CV:
+filtered_data_test$predicted_log_price_model1_cv <- predict.train(lm_model1_cv, newdata = filtered_data_test)
+filtered_data_test$predicted_log_price_model2_cv <- predict.train(lm_model2_cv, newdata = filtered_data_test)
+filtered_data_test$predicted_log_price_model3_cv <- predict.train(lm_model3_cv, newdata = filtered_data_test)
+filtered_data_test$predicted_log_price_model4_cv <- predict.train(lm_model4_cv, newdata = filtered_data_test)
+filtered_data_test$predicted_log_price_model5_cv <- predict.train(lm_model_lasso_cv, newdata = filtered_data_test)
+# RMSE W/O CV:
+model1_RMSE <- RMSE(filtered_data_test$predicted_log_price_model1, filtered_data_test$log_price)
+model2_RMSE <- RMSE(filtered_data_test$predicted_log_price_model2, filtered_data_test$log_price)
+model3_RMSE <- RMSE(filtered_data_test$predicted_log_price_model3, filtered_data_test$log_price)
+model4_RMSE <- RMSE(filtered_data_test$predicted_log_price_model4, filtered_data_test$log_price)
+model5_RMSE <- RMSE(filtered_data_test$predicted_log_price_model5, filtered_data_test$log_price)
+#RMSE with CV:
+model1_RMSE_cv <- RMSE(filtered_data_test$predicted_log_price_model1_cv, filtered_data_test$log_price)
+model2_RMSE_cv <- RMSE(filtered_data_test$predicted_log_price_model2_cv, filtered_data_test$log_price)
+model3_RMSE_cv <- RMSE(filtered_data_test$predicted_log_price_model3_cv, filtered_data_test$log_price)
+model4_RMSE_cv <- RMSE(filtered_data_test$predicted_log_price_model4_cv, filtered_data_test$log_price)
+model5_RMSE_cv <- RMSE(filtered_data_test$predicted_log_price_model5_cv, filtered_data_test$log_price)
+```
+
+<strong> RMSE of different models on the test set for a given neighborhood using log price</strong>
+```{r}
+#Create a table:
+table1 <- data.table(Models = c("model1", "model2", "model3", "model4", "model5_lasso"), RMSE_WITHOUT_CV = c(model1_RMSE, model2_RMSE, model3_RMSE, model4_RMSE, model5_RMSE), RMSE_WITH_CV = c(model1_RMSE_cv, model2_RMSE_cv, model3_RMSE_cv, model4_RMSE_cv, model5_RMSE_cv))
+
+kable(table1, align = 'c', digits = 3)
+```
+
+<strong>Full London:</strong>
+```{r}
+#######
+#ON the full dataset:
+#W/O CV:
+data_test$predicted_log_price_model1 <- predict.train(lm_model_full1, newdata = data_test)
+data_test$predicted_log_price_model2 <- predict.train(lm_model_full2, newdata = data_test)
+data_test$predicted_log_price_model3 <- predict.train(lm_model_full3, newdata = data_test)
+data_test$predicted_log_price_model4 <- predict.train(lm_model_full4, newdata = data_test)
+data_test$predicted_log_price_model5 <- predict.train(lm_model_full_lasso, newdata = data_test)
+#With CV:
+data_test$predicted_log_price_model1_cv <- predict.train(lm_model_full1_cv, newdata = data_test)
+data_test$predicted_log_price_model2_cv <- predict.train(lm_model_full2_cv, newdata = data_test)
+data_test$predicted_log_price_model3_cv <- predict.train(lm_model_full3_cv, newdata = data_test)
+data_test$predicted_log_price_model4_cv <- predict.train(lm_model_full4_cv, newdata = data_test)
+data_test$predicted_log_price_model5_cv <- predict.train(lm_model_full_lasso_cv, newdata = data_test)
+# RMSE W/O CV:
+model1_RMSE_full <- RMSE(data_test$predicted_log_price_model1, data_test$log_price)
+model2_RMSE_full <- RMSE(data_test$predicted_log_price_model2, data_test$log_price)
+model3_RMSE_full <- RMSE(data_test$predicted_log_price_model3, data_test$log_price)
+model4_RMSE_full <- RMSE(data_test$predicted_log_price_model4, data_test$log_price)
+model5_RMSE_full <- RMSE(data_test$predicted_log_price_model5, data_test$log_price)
+#RMSE with CV:
+model1_RMSE_cv_full <- RMSE(data_test$predicted_log_price_model1_cv, data_test$log_price)
+model2_RMSE_cv_full <- RMSE(data_test$predicted_log_price_model2_cv, data_test$log_price)
+model3_RMSE_cv_full <- RMSE(data_test$predicted_log_price_model3_cv, data_test$log_price)
+model4_RMSE_cv_full <- RMSE(data_test$predicted_log_price_model4_cv, data_test$log_price)
+model5_RMSE_cv_full <- RMSE(data_test$predicted_log_price_model5_cv, data_test$log_price)
+```
+
+<strong> RMSE of different models on the test set for full London using log_price: </strong>
+```{r}
+table2 <- data.table(Models = c("model1", "model2", "model3", "model4", "model5_lasso"), RMSE_WITHOUT_CV = c(model1_RMSE_full, model2_RMSE_full, model3_RMSE_full, model4_RMSE_full, model5_RMSE_cv_full), RMSE_WITH_CV = c(model1_RMSE_cv_full, model2_RMSE_cv_full, model3_RMSE_cv_full, model4_RMSE_cv_full, model5_RMSE_cv_full))
+
+kable(table2, align = 'c', digits = 3)
+```
+
+<strong> In the next part I try to convert my log prices back to level prices and try to evaluate my model on them: </strong>
+
+For simplification and due to the fact that CV models and not CV models are nearly identical in this problem set from now on I will use only the CV models for this exercise:
+```{r}
+# On the filtered data:
+# With CV:
+filtered_data_test$predicted_log_price_model1_real_values <- exp(filtered_data_test$predicted_log_price_model1_cv)
+filtered_data_test$predicted_log_price_model2_real_values <- exp(filtered_data_test$predicted_log_price_model2_cv)
+filtered_data_test$predicted_log_price_model3_real_values <- exp(filtered_data_test$predicted_log_price_model3_cv)
+filtered_data_test$predicted_log_price_model4_real_values <- exp(filtered_data_test$predicted_log_price_model4_cv)
+filtered_data_test$predicted_log_price_model5_real_values <- exp(filtered_data_test$predicted_log_price_model5_cv)
+
+#Calculate RMSE:
+RMSE1_real <- RMSE(filtered_data_test$predicted_log_price_model1_real_values, filtered_data_test$price)
+RMSE2_real <- RMSE(filtered_data_test$predicted_log_price_model2_real_values, filtered_data_test$price)
+RMSE3_real <- RMSE(filtered_data_test$predicted_log_price_model3_real_values, filtered_data_test$price)
+RMSE4_real <- RMSE(filtered_data_test$predicted_log_price_model4_real_values, filtered_data_test$price)
+RMSE5_real <- RMSE(filtered_data_test$predicted_log_price_model5_real_values, filtered_data_test$price)
+
+#On the full Lonond data:
+#With CV:
+data_test$predicted_log_price_model1_real_values <- exp(data_test$predicted_log_price_model1_cv)
+data_test$predicted_log_price_model2_real_values <- exp(data_test$predicted_log_price_model2_cv)
+data_test$predicted_log_price_model3_real_values <- exp(data_test$predicted_log_price_model3_cv)
+data_test$predicted_log_price_model4_real_values <- exp(data_test$predicted_log_price_model4_cv)
+data_test$predicted_log_price_model5_real_values <- exp(data_test$predicted_log_price_model5_cv)
+
+RMSE1_real_all <- RMSE(data_test$predicted_log_price_model1_real_values, data_test$price)
+RMSE2_real_all <- RMSE(data_test$predicted_log_price_model2_real_values, data_test$price)
+RMSE3_real_all <- RMSE(data_test$predicted_log_price_model3_real_values, data_test$price)
+RMSE4_real_all <- RMSE(data_test$predicted_log_price_model4_real_values, data_test$price)
+RMSE5_real_all <- RMSE(data_test$predicted_log_price_model5_real_values, data_test$price)
+```
+
+Create tables with the results:
+```{r}
+table3 <- data.table(Models = c("model1", "model2", "model3", "model4", "model5_lasso"), RMSE_WITH_CV = c(RMSE1_real, RMSE2_real, RMSE3_real, RMSE4_real, RMSE5_real))
+
+table4 <- data.table(Models = c("model1", "model2", "model3", "model4", "model5_lasso"), RMSE_WITH_CV = c(RMSE1_real_all, RMSE2_real_all, RMSE3_real_all, RMSE4_real_all, RMSE5_real_all))
+```
+
+<strong> RMSE of different models on the test set for a given neighborhood using level price: </strong>
+
+```{r}
+kable(table3, align = 'c', digits = 3)
+```
+
+<strong> RMSE of different models on the test set for a full London using level price: </strong>
+```{r}
+kable(table4, align = 'c', digits = 3)
+```
+
+<strong> BUT we can get better results by using a correction term when we converting back our log_price variable </strong>
+
+If we want to convert the log values to normal (level) values we should use the exp() function + a correction term:
+
+Calculate correction term:
+```{r}
+#for the filtered data:
+filtered_data_correctionterm <- sum((filtered_data_test$log_price - filtered_data_test$predicted_log_price_model1)^2/(length(filtered_data_test$log_price)-1))/2
+
+full_data_correctionterm <- sum((data_test$log_price - data_test$predicted_log_price_model1)^2/(length(data_test$log_price)-1))/2
+
+filtered_data_correctionterm
+full_data_correctionterm
+```
+
+Both of the correction terms are around 0.1. I know there are many of them (as many as many model I have) but now for simplification I will use 0.1 for all the correction terms for all models.
+
+```{r}
+# On the filtered data:
+# With CV:
+filtered_data_test$predicted_log_price_model1_real_values_correction <- exp(filtered_data_test$predicted_log_price_model1_cv + 0.10)
+filtered_data_test$predicted_log_price_model2_real_values_correction <- exp(filtered_data_test$predicted_log_price_model2_cv + 0.10)
+filtered_data_test$predicted_log_price_model3_real_values_correction <- exp(filtered_data_test$predicted_log_price_model3_cv + 0.10)
+filtered_data_test$predicted_log_price_model4_real_values_correction <- exp(filtered_data_test$predicted_log_price_model4_cv + 0.10)
+filtered_data_test$predicted_log_price_model5_real_values_correction <- exp(filtered_data_test$predicted_log_price_model5_cv + 0.10)
+
+RMSE1_real_correction <- RMSE(filtered_data_test$predicted_log_price_model1_real_values_correction, filtered_data_test$price)
+RMSE2_real_correction <- RMSE(filtered_data_test$predicted_log_price_model2_real_values_correction, filtered_data_test$price)
+RMSE3_real_correction <- RMSE(filtered_data_test$predicted_log_price_model3_real_values_correction, filtered_data_test$price)
+RMSE4_real_correction <- RMSE(filtered_data_test$predicted_log_price_model4_real_values_correction, filtered_data_test$price)
+RMSE5_real_correction <- RMSE(filtered_data_test$predicted_log_price_model5_real_values_correction, filtered_data_test$price)
+
+#On the full Lonond data:
+#With CV:
+data_test$predicted_log_price_model1_real_values_correction <- exp(data_test$predicted_log_price_model1_cv + 0.10)
+data_test$predicted_log_price_model2_real_values_correction <- exp(data_test$predicted_log_price_model2_cv + 0.10)
+data_test$predicted_log_price_model3_real_values_correction <- exp(data_test$predicted_log_price_model3_cv + 0.10)
+data_test$predicted_log_price_model4_real_values_correction <- exp(data_test$predicted_log_price_model4_cv + 0.10)
+data_test$predicted_log_price_model5_real_values_correction <- exp(data_test$predicted_log_price_model5_cv + 0.10)
+
+RMSE1_real_all_correction <- RMSE(data_test$predicted_log_price_model1_real_values_correction, data_test$price)
+RMSE2_real_all_correction <- RMSE(data_test$predicted_log_price_model2_real_values_correction, data_test$price)
+RMSE3_real_all_correction <- RMSE(data_test$predicted_log_price_model3_real_values_correction, data_test$price)
+RMSE4_real_all_correction <- RMSE(data_test$predicted_log_price_model4_real_values_correction, data_test$price)
+RMSE5_real_all_correction <- RMSE(data_test$predicted_log_price_model5_real_values_correction, data_test$price)
+
+table5 <- data.table(Models = c("model1", "model2", "model3", "model4", "model5_lasso"), RMSE_WITH_CV = c(RMSE1_real_correction, RMSE2_real_correction, RMSE3_real_correction, RMSE4_real_correction, RMSE5_real_correction))
+
+table6 <- data.table(Models = c("model1", "model2", "model3", "model4", "model5_lasso"), RMSE_WITH_CV = c(RMSE1_real_all_correction, RMSE2_real_all_correction, RMSE3_real_all_correction, RMSE4_real_all_correction, RMSE5_real_all_correction))
+```
+
+<strong> RMSE of different models on the test set for a given neighborhood using level price with correction term:</strong>
+```{r}
+kable(table5, align = 'c', digits = 3)
+```
+
+<strong>RMSE of different models on the test set for the full London dataset using level price with correction term: </strong>
+```{r}
+kable(table6, align = 'c', digits = 3)
+```
+
+These results seems better than without the correction term, but just a little.
+
+<strong> Some Graphs for the exercise: </strong>
+
+Predictions for a given neighborhood:
+
+```{r}
+#log price:
+ggplot(filtered_data_test, aes(x=log_price, y=predicted_log_price_model5_cv)) + geom_point() + geom_abline(slope = 1, linetype = 2)
+
+ggplot(filtered_data_test, aes(log_price-predicted_log_price_model5_cv)) + geom_histogram(bins = 50)
+
+#level price with correction term:
+ggplot(filtered_data_test, aes(x=price, y=predicted_log_price_model5_real_values)) + geom_point() + geom_abline(slope = 1, linetype = 2)
+
+ggplot(filtered_data_test, aes(price-predicted_log_price_model5_real_values)) + geom_histogram(bins = 50)
+
+```
+
+Predictions for a full London:
+```{r}
+#log price:
+ggplot(data_test, aes(x=log_price, y=predicted_log_price_model5_cv)) + geom_point() + geom_abline(slope = 1, linetype = 2)
+
+ggplot(data_test, aes(log_price-predicted_log_price_model5_cv)) + geom_histogram(bins = 50)
+
+#level price with correction term:
+ggplot(data_test, aes(x=price, y=predicted_log_price_model5_real_values)) + geom_point() + geom_abline(slope = 1, linetype = 2)
+
+ggplot(data_test, aes(price-predicted_log_price_model5_real_values)) + geom_histogram(bins = 50)
+```
+
+All the graph suggesting a well calibrated models
+
+<strong> At the end I try to create the best model with interactions for the full London dataset: </strong>
+```{r}
+lm_model_full_lasso_cv_final <- train(log_price ~ as.factor(neighbourhood_cleansed) * (poly(accommodates,2) + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + bathrooms + as.factor(host_is_superhost)),
+                  data = data_train,
+                  method = "glmnet",
+                  trControl = trainControl(method = "cv", number = 10),
+                  #preProcess = c("center", "scale"),
+                  tuneGrid = expand.grid("alpha" = c(1),"lambda" = c(0.1, 0.01, 0.001, 0.0001)))
+
+#predict prices on the test set of full London:
+data_test$predicted_final_model_log <- predict.train(lm_model_full_lasso_cv_final, newdata = data_test)
+
+RMSE_final_log <- RMSE(data_test$predicted_final_model_log, data_test$log_price)
+RMSE_final_real <- RMSE(exp(data_test$predicted_final_model_log + 0.1), data_test$price)
+```
+RMSE of The final model Log:
+```{r}
+RMSE_final_log
+```
+RMSE of the final model if I convert back the log values to level values and using correction term:
+```{r}
+RMSE_final_real
+```
+
+## SUMMARY TABLES, SUMMARY:
+
+To be clear I summarize my findings in the following two tables. I collected all my models RMSEs which was evaluated on the Test set for both a given neighborhood and for full London.
+
+<strong>For a given neighborhood my models give the following RMSEs:</strong>
+
+```{r}
+final_table1 <- data.table(Models = c("model1", "model2", "model3", "model4", "model5_lasso"), `Using Log Prices:` = c(" "), `RMSE without CV` = c(model1_RMSE, model2_RMSE, model3_RMSE, model4_RMSE, model5_RMSE), `RMSE with CV` = c(model1_RMSE_cv, model2_RMSE_cv, model3_RMSE_cv, model4_RMSE_cv, model5_RMSE_cv), `Converted Level Prices:` = c(" "), `RMSE with CV without correction term` = c(RMSE1_real, RMSE2_real, RMSE3_real, RMSE4_real, RMSE5_real), `RMSE with CV with correction term` = c(RMSE1_real_correction, RMSE2_real_correction, RMSE3_real_correction, RMSE4_real_correction, RMSE5_real_correction))
+
+kable(final_table1, align = 'c', digits = 3)
+```
+
+Which model I would choose?
+I would choose the 4th model which gives almost the same RMSE as the 5th LASSO model. I do not think using LASSO has a lots of effect in this case and interpretation of the 4th model is easier for an outsider.
+
+Also, for predictions I think the 4th model is the one which I would choose, where I converted back my log_predictions for level using a correction term.
+
+<strong>For entire London my models give the following RMSEs:</strong>
+```{r}
+final_table2 <- data.table(Models = c("model1", "model2", "model3", "model4", "model5_lasso", "+final model"), `Using Log Price:` = c(" "), `RMSE without CV` = c(model1_RMSE_full, model2_RMSE_full, model3_RMSE_full, model4_RMSE_full, model5_RMSE_cv_full, NA), `RMSE with CV` = c(model1_RMSE_cv_full, model2_RMSE_cv_full, model3_RMSE_cv_full, model4_RMSE_cv_full, model5_RMSE_cv_full, RMSE_final_log), `Converted Level Prices:` = c(" "), `RMSE with CV without correction term` = c(RMSE1_real_all, RMSE2_real_all, RMSE3_real_all, RMSE4_real_all, RMSE5_real_all, NA), `RMSE with CV with correction term` = c(RMSE1_real_all_correction, RMSE2_real_all_correction, RMSE3_real_all_correction, RMSE4_real_all_correction, RMSE5_real_all_correction, RMSE_final_real))
+
+kable(final_table2, align = 'c', digits = 3)
+```
+
+Which model I would choose?
+Same as previously. I would choose the 4th model which gives almost the same RMSE as the 5th LASSO model. I do not think using LASSO has a lots of effect in this case and interpretation of the 4th model is easier for an outsider.
+
+BUT if I would like to give the best predictions I would choose the final model where I introduced interactions. It helps a bit but not too much, but resulting a more accurate price prediction based on the RMSE.
+
+Also, for predictions I think the 4th model is the one which I would choose, where I converted back my log_predictions for level using a correction term.
+
+## EXTRA EXERCISE: TASK 2
+
+<strong> Regression Tree on the given neighborhood </strong>
+
+```{r}
+set.seed(1234)
+
+tune_grid <- data.frame("cp" = c(0.0001, 0.001, 0.01, 0.1, 0.2, 0.3, 0.002, 0.003, 0.005, 0.00001, 0.000001))
+
+rpart_model_n <- train(price ~ accommodates + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + bathrooms + as.factor(host_is_superhost), 
+                   data = filtered_data_train, 
+                   method = "rpart", 
+                   trControl = trainControl(method = "cv", number = 10),
+                   tuneGrid = tune_grid)
+
+rpart_model_n
+
+ggplot(rpart_model_n) + scale_x_log10()
+```
+
+This is the best plot that I can do, due to the fact that it is so complex.
+```{r, message=FALSE, warning= FALSE}
+fancyRpartPlot(rpart_model_n$finalModel, main = "Large tree of a given Neighbourhood", sub = " ", tweak=3, type = 2)
+```
+
+<strong> Regression tree on full London </strong>
+
+```{r}
+tune_grid <- data.frame("cp" = c(0.0001, 0.001, 0.01, 0.1, 0.2, 0.3, 0.002, 0.003, 0.005, 0.00001, 0.000001))
+
+rpart_model_l <- train(price ~ accommodates + as.factor(neighbourhood_cleansed) + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + bathrooms + as.factor(host_is_superhost), 
+                   data = data_train, 
+                   method = "rpart", 
+                   trControl = trainControl(method = "cv", number = 10),
+                   tuneGrid = tune_grid)
+
+rpart_model_l
+```
+```{r}
+ggplot(rpart_model_l) + scale_x_log10()
+```
+
+The tree is too complex for plotting therefore I do not plot it.
+
+<strong> Random Forest on the given neighborhood </strong>
+
+```{r, message=FALSE, warning= FALSE}
+rf_model_n<-train(price ~ accommodates + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + bathrooms + as.factor(host_is_superhost),
+                data=filtered_data_train,
+                method="rf",
+                trControl=trainControl(method="cv",number=5),
+                prox=TRUE,
+                allowParallel=TRUE,
+                importance=TRUE,
+                ntree = 250)
+rf_model_n
+rf_model_n$finalModel
+```
+Variable importance:
+```{r}
+varImp(rf_model_n)
+```
+
+<strong> Random Forest on full London </strong>
+
+Actually my computer is not good enough to train a random forest on the full dataset so I use only a small subset of it:
+
+```{r}
+cut <- createDataPartition(y = data_train$price, times = 1, p = 0.1, list = FALSE)
+
+data_train_small <- data_train[cut, ]
+
+data_train_big <- data_train[-cut, ]
+
+```
+
+
+
+```{r, message=FALSE, warning= FALSE}
+rf_model_l<-train(price ~ accommodates + neighbourhood_cleansed + as.factor(room_type) + as.factor(location_score_above_9) + as.factor(security_deposit_factor) + bathrooms + as.factor(host_is_superhost),
+                data=data_train_small,
+                method="rf",
+                trControl=trainControl(method="cv",number=5),
+                prox=TRUE,
+                allowParallel=TRUE,
+                importance=TRUE,
+                ntree = 250)
+rf_model_l
+rf_model_l$finalModel
+```
+Variable importance:
+```{r}
+varImp(rf_model_l)
+```
+
+#### Comparing results:
+
+<strong> Predict prices </strong>
+```{r}
+#given neighbourhood:
+filtered_data_test$tree <- predict.train(rpart_model_n, newdata = filtered_data_test)
+filtered_data_test$random_f <- predict.train(rf_model_n, newdata = filtered_data_test)
+
+RMSE_tree <- RMSE(filtered_data_test$tree, filtered_data_test$price)
+RMSE_rf <- RMSE(filtered_data_test$random_f, filtered_data_test$price)
+
+#Full London:
+data_test$tree <- predict.train(rpart_model_l, newdata = data_test)
+data_test$random_f <- predict.train(rf_model_l, newdata = data_test)
+
+RMSE_tree_full <- RMSE(data_test$tree, data_test$price)
+RMSE_rf_full <- RMSE(data_test$random_f, data_test$price)
+
+```
+
+<strong> Comparing Regression tree vs. Random Forest vs. the Best Regression models in a given neighborhood </strong>
+```{r}
+comparing_table1 <- data.table(Models = c("Regression tree", "Random Forest", "Best Regression"), RMSE = c(RMSE_tree, RMSE_rf, RMSE4_real_correction))
+
+kable(comparing_table1, digits = 3, align = 'c')
+```
+
+We can conclude from the table above that all the models are giving almost the same results if we compare their RMSEs on the test set. However the tree model beats the best regression model.
+
+
+<strong> Comparing Regression tree vs. Random Forest vs. the best Regression in full London </strong>
+```{r}
+comparing_table2 <- data.table(Models = c("Regression tree", "Random Forest", "Best Regression"), RMSE = c(RMSE_tree_full, RMSE_rf_full, RMSE5_real_all_correction))
+
+kable(comparing_table2, digits = 3, align = 'c')
+```
+
+We can conclude from the table above that all the models are giving almost the same results if we compare their RMSEs on the test set. However the tree model beats the best regression model.
